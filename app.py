@@ -2,20 +2,38 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
+from datetime import datetime
 
 # 1. 網頁基本設定
 st.set_page_config(layout="wide", page_title="港股 AI 技術分析儀表板")
 
+# 常見港股中文名稱對照（方便自動搜尋中文新聞）
+HK_STOCK_NAMES = {
+    "0700.HK": "騰訊控股",
+    "9988.HK": "阿里巴巴",
+    "0005.HK": "匯豐控股",
+    "3690.HK": "美團",
+    "0388.HK": "香港交易所",
+    "0941.HK": "中國移動",
+    "1299.HK": "友邦保險",
+    "1810.HK": "小米集團",
+    "9618.HK": "京東集團",
+    "1211.HK": "比亞迪股份"
+}
+
 col_input1, col_input2 = st.columns([1, 3])
 with col_input1:
-    ticker = st.text_input("輸入港股代碼 (例如 0700.HK, 9988.HK, 0005.HK)", value="0700.HK").upper()
+    ticker = st.text_input("輸入港股代碼 (例如 0700.HK, 9988.HK, 0005.HK)", value="0700.HK").strip().upper()
 with col_input2:
     period = st.selectbox("選擇時間範圍", ["6mo", "1y", "2y"], index=1)
 
 # 2. 抓取港股歷史數據
 @st.cache_data(ttl=300)
 def load_data(symbol, time_period):
-    df = yf.download(symbol, period=time_period)
+    df = yf.download(symbol, period=time_period, progress=False)
     if df.empty:
         return df
     if isinstance(df.columns, pd.MultiIndex):
@@ -28,7 +46,7 @@ if df.empty:
     st.error(f"找不到代碼 `{ticker}` 的資料，請確認格式（例如：騰訊請輸入 `0700.HK`）。")
     st.stop()
 
-# 3. 使用純 Pandas 計算各項技術指標（不依賴 pandas_ta）
+# 3. 使用純 Pandas 計算各項技術指標
 # (A) 移動平均線 (MA)
 df['MA5'] = df['Close'].rolling(window=5).mean()
 df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -110,10 +128,83 @@ else:
 
 overall_rating = "偏多進攻" if score >= 3 else ("偏空防守" if score <= -3 else "中性觀望")
 
+# 5. 抓取財經新聞函數
+def fetch_stock_news(symbol):
+    zh_news = []
+    yf_news = []
+    stock_name = HK_STOCK_NAMES.get(symbol, symbol)
+
+    # (A) 抓取中文財經新聞 (Bing News RSS)
+    try:
+        query_keyword = f"{stock_name} 股價" if stock_name != symbol else f"{symbol} 港股"
+        encoded_q = urllib.parse.quote(query_keyword)
+        rss_url = f"https://www.bing.com/news/search?q={encoded_q}&format=rss&mkt=zh-HK"
+        
+        req = urllib.request.Request(
+            rss_url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+        )
+        with urllib.request.urlopen(req, timeout=8) as response:
+            xml_data = response.read()
+            
+        root = ET.fromstring(xml_data)
+        for item in root.findall('./channel/item')[:6]:
+            title = item.find('title').text if item.find('title') is not None else "無標題"
+            link = item.find('link').text if item.find('link') is not None else "#"
+            pub_date = item.find('pubDate').text if item.find('pubDate') is not None else ""
+            source = "Bing 財經"
+            for child in item:
+                if child.tag.endswith('Source') and child.text:
+                    source = child.text
+                    break
+            zh_news.append({
+                "title": title,
+                "link": link,
+                "publisher": source,
+                "time": pub_date[:16]
+            })
+    except Exception as e:
+        st.warning(f"中文新聞抓取異常：{e}")
+
+    # (B) 抓取 Yahoo Finance 相關新聞
+    try:
+        raw_news = yf.Ticker(symbol).news or []
+        if not raw_news:
+            raw_news = yf.Search(symbol, news_count=6).news or []
+            
+        for item in raw_news[:6]:
+            if 'content' in item and isinstance(item['content'], dict):
+                c = item['content']
+                title = c.get('title', '無標題')
+                publisher = c.get('provider', {}).get('displayName', 'Yahoo Finance')
+                link = (c.get('canonicalUrl') or {}).get('url') or (c.get('clickThroughUrl') or {}).get('url') or '#'
+                pub_time = c.get('pubDate', '')[:10]
+            else:
+                title = item.get('title', '無標題')
+                publisher = item.get('publisher', 'Yahoo Finance')
+                link = item.get('link', '#')
+                ts = item.get('providerPublishTime', 0)
+                pub_time = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if ts else ''
+            
+            if title and title != '無標題':
+                yf_news.append({
+                    "title": title,
+                    "link": link,
+                    "publisher": publisher,
+                    "time": pub_time
+                })
+    except Exception as e:
+        st.warning(f"Yahoo 新聞抓取異常：{e}")
+
+    return zh_news, yf_news
+
 # ==========================================
 # 畫面渲染區塊
 # ==========================================
-st.title(f"📊 {ticker} 技術分析看盤儀表板")
+display_title = f"{HK_STOCK_NAMES[ticker]} ({ticker})" if ticker in HK_STOCK_NAMES else ticker
+st.title(f"📊 {display_title} 技術分析看盤儀表板")
 
 st.subheader("1. 市場概況與多空評級")
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
@@ -133,7 +224,7 @@ ind4.metric("MACD 柱狀體", macd_status)
 
 st.divider()
 
-st.subheader(f"3. {ticker} 主 K 線與多空均線走勢圖")
+st.subheader(f"3. {display_title} 主 K 線與多空均線走勢圖")
 fig = go.Figure()
 
 fig.add_trace(go.Candlestick(
@@ -155,3 +246,30 @@ fig.update_layout(
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
 )
 st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# ==========================================
+# 第 4 區塊：相關財經新聞動態
+# ==========================================
+st.subheader(f"4. 📰 {display_title} 相關財經新聞")
+
+zh_news_list, yf_news_list = fetch_stock_news(ticker)
+
+news_col1, news_col2 = st.columns(2)
+
+with news_col1:
+    st.markdown("#### 🇭🇰 香港財經快訊")
+    if zh_news_list:
+        for item in zh_news_list:
+            st.markdown(f"- **[{item['title']}]({item['link']})**  \n  <small>來源：{item['publisher']} ｜ {item['time']}</small>", unsafe_allow_html=True)
+    else:
+        st.info("暫無相關中文新聞。")
+
+with news_col2:
+    st.markdown("#### 🌐 Yahoo Finance 市場報導")
+    if yf_news_list:
+        for item in yf_news_list:
+            st.markdown(f"- **[{item['title']}]({item['link']})**  \n  <small>來源：{item['publisher']} ｜ {item['time']}</small>", unsafe_allow_html=True)
+    else:
+        st.info("暫無相關英文新聞。")
