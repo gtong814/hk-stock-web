@@ -5,7 +5,8 @@ import plotly.graph_objects as go
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 # 1. 網頁基本設定
 st.set_page_config(layout="wide", page_title="港股 AI 技術分析儀表板")
@@ -21,7 +22,13 @@ HK_STOCK_NAMES = {
     "1299.HK": "友邦保險",
     "1810.HK": "小米集團",
     "9618.HK": "京東集團",
-    "1211.HK": "比亞迪股份"
+    "1211.HK": "比亞迪股份",
+    "9660.HK": "地平線機器人",
+    "6082.HK": "壁仞科技",
+    "1133.HK": "哈爾濱電氣",
+    "2858.HK": "易鑫集團",
+    "6166.HK": "劍橋科技",
+    "1686.HK": "新意網集團"
 }
 
 col_input1, col_input2 = st.columns([1, 3])
@@ -42,7 +49,7 @@ def load_data(symbol, time_period):
 
 df = load_data(ticker, period)
 
-if df.empty:
+if df.empty or len(df) < 20:
     st.error(f"找不到代碼 `{ticker}` 的資料，請確認格式（例如：騰訊請輸入 `0700.HK`）。")
     st.stop()
 
@@ -128,73 +135,92 @@ else:
 
 overall_rating = "偏多進攻" if score >= 3 else ("偏空防守" if score <= -3 else "中性觀望")
 
-# 5. 抓取財經新聞函數
+# 5. 抓取最新即時財經新聞函數（限定近 3 天 + 香港時間由新到舊排序）
 def fetch_stock_news(symbol):
     zh_news = []
     yf_news = []
     stock_name = HK_STOCK_NAMES.get(symbol, symbol)
+    hk_tz = timezone(timedelta(hours=8)) # 香港時區 (UTC+8)
 
-    # (A) 抓取中文財經新聞 (Bing News RSS)
+    # (A) 抓取最新香港中文財經新聞 (Google News HK RSS + when:3d)
     try:
-        query_keyword = f"{stock_name} 股價" if stock_name != symbol else f"{symbol} 港股"
+        clean_name = stock_name.replace("-W", "").replace("-SW", "")
+        query_keyword = f"{clean_name} when:3d" if clean_name != symbol else f"{symbol} 港股 when:3d"
         encoded_q = urllib.parse.quote(query_keyword)
-        rss_url = f"https://www.bing.com/news/search?q={encoded_q}&format=rss&mkt=zh-HK"
+        rss_url = f"https://news.google.com/rss/search?q={encoded_q}&hl=zh-HK&gl=HK&ceid=HK:zh-Hant"
         
         req = urllib.request.Request(
             rss_url,
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         )
         with urllib.request.urlopen(req, timeout=8) as response:
             xml_data = response.read()
             
         root = ET.fromstring(xml_data)
-        for item in root.findall('./channel/item')[:6]:
+        temp_list = []
+        for item in root.findall('./channel/item')[:10]:
             title = item.find('title').text if item.find('title') is not None else "無標題"
             link = item.find('link').text if item.find('link') is not None else "#"
-            pub_date = item.find('pubDate').text if item.find('pubDate') is not None else ""
-            source = "Bing 財經"
-            for child in item:
-                if child.tag.endswith('Source') and child.text:
-                    source = child.text
-                    break
-            zh_news.append({
+            pub_date_str = item.find('pubDate').text if item.find('pubDate') is not None else ""
+            source = item.find('source').text if item.find('source') is not None else "香港財經"
+            
+            try:
+                dt = parsedate_to_datetime(pub_date_str).astimezone(hk_tz)
+                formatted_time = dt.strftime('%Y-%m-%d %H:%M')
+                timestamp = dt.timestamp()
+            except Exception:
+                formatted_time = pub_date_str[:16]
+                timestamp = 0
+
+            temp_list.append({
                 "title": title,
                 "link": link,
                 "publisher": source,
-                "time": pub_date[:16]
+                "time": formatted_time,
+                "ts": timestamp
             })
+            
+        temp_list.sort(key=lambda x: x["ts"], reverse=True)
+        zh_news = temp_list[:6]
     except Exception as e:
         st.warning(f"中文新聞抓取異常：{e}")
 
-    # (B) 抓取 Yahoo Finance 相關新聞
+    # (B) 抓取 Yahoo Finance 最新相關新聞 (按時間由新到舊排序)
     try:
         raw_news = yf.Ticker(symbol).news or []
-        if not raw_news:
-            raw_news = yf.Search(symbol, news_count=6).news or []
-            
-        for item in raw_news[:6]:
+        temp_yf = []
+        for item in raw_news[:10]:
             if 'content' in item and isinstance(item['content'], dict):
                 c = item['content']
                 title = c.get('title', '無標題')
                 publisher = c.get('provider', {}).get('displayName', 'Yahoo Finance')
                 link = (c.get('canonicalUrl') or {}).get('url') or (c.get('clickThroughUrl') or {}).get('url') or '#'
-                pub_time = c.get('pubDate', '')[:10]
+                pub_str = c.get('pubDate', '')
+                try:
+                    dt = datetime.fromisoformat(pub_str.replace('Z', '+00:00')).astimezone(hk_tz)
+                    pub_time = dt.strftime('%Y-%m-%d %H:%M')
+                    ts = dt.timestamp()
+                except Exception:
+                    pub_time = pub_str[:16]
+                    ts = 0
             else:
                 title = item.get('title', '無標題')
                 publisher = item.get('publisher', 'Yahoo Finance')
                 link = item.get('link', '#')
                 ts = item.get('providerPublishTime', 0)
-                pub_time = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if ts else ''
+                pub_time = datetime.fromtimestamp(ts, tz=hk_tz).strftime('%Y-%m-%d %H:%M') if ts else ''
             
             if title and title != '無標題':
-                yf_news.append({
+                temp_yf.append({
                     "title": title,
                     "link": link,
                     "publisher": publisher,
-                    "time": pub_time
+                    "time": pub_time,
+                    "ts": ts
                 })
+                
+        temp_yf.sort(key=lambda x: x["ts"], reverse=True)
+        yf_news = temp_yf[:6]
     except Exception as e:
         st.warning(f"Yahoo 新聞抓取異常：{e}")
 
@@ -252,7 +278,7 @@ st.divider()
 # ==========================================
 # 第 4 區塊：相關財經新聞動態
 # ==========================================
-st.subheader(f"4. 📰 {display_title} 相關財經新聞")
+st.subheader(f"4. 📰 {display_title} 最新財經新聞 (近 3 日)")
 
 zh_news_list, yf_news_list = fetch_stock_news(ticker)
 
@@ -264,7 +290,7 @@ with news_col1:
         for item in zh_news_list:
             st.markdown(f"- **[{item['title']}]({item['link']})**  \n  <small>來源：{item['publisher']} ｜ {item['time']}</small>", unsafe_allow_html=True)
     else:
-        st.info("暫無相關中文新聞。")
+        st.info("近 3 日暫無相關中文新聞。")
 
 with news_col2:
     st.markdown("#### 🌐 Yahoo Finance 市場報導")
